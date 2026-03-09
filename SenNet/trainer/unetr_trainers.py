@@ -60,6 +60,7 @@ class UNETRPPTrainer(SenTrainer):
                                                             print_args=True)
 
         network = UNETR_PP(
+            img_size=config.patch_size,
             **architecture_kwargs
         )
 
@@ -67,3 +68,4 @@ class UNETRPPTrainer(SenTrainer):
             network.apply(network.initialize)
 
         return network
+

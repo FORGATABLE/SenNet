@@ -13,17 +13,18 @@ from SenNet.network.net.mamba_blocks import MambaLayer
 
 class SelectiveFusionBlock(nn.Module):
     """
-    实现 SIB-UNet 和 SMM-UNet 中的Selective Fusion Block。
+    Selective Fusion Block used in SIB-UNet and SMM-UNet.
     """
 
-    def __init__(self,
-                 channels : int,
-                 conv_op: Type[_ConvNd],
-                 proj_type: str = 'mlp', # 选择投影层的类型，可以是'conv'或者'mlp'或者'kan'.
-                 use_max: bool = False,
-        ):
+    def __init__(
+        self,
+        channels: int,
+        conv_op: Type[_ConvNd],
+        proj_type: str = 'mlp',  # 'conv', 'mlp' or 'kan'
+        use_max: bool = False,
+    ):
         super().__init__()
-        # 投影层，特征通道数缩小为原来的1/2。
+        self.proj_type = proj_type
         self.projection = None
         if proj_type == 'mlp':
             self.projection = nn.Linear(channels * 2, channels)
@@ -36,33 +37,33 @@ class SelectiveFusionBlock(nn.Module):
         self.nonlin = nn.Softmax(dim=1)
         self.use_max = use_max
 
-
     def forward(self, x1, x2):
-        """
-        Args:
-            x1: 输入1, shape: (B, C, H, W, D)。
-            x2: 输入2, shape: (B, C, H, W, D)。
-        """
-        # 连接两个输入
-        x = torch.cat([x1, x2], dim=1)  # shape: (B, 2C, H, W, D)
-        # 全局平均池化
-        mean_x = torch.mean(x, dim=[2, 3, 4], keepdim=True) # shape: (B, 2C, 1, 1, 1)
+        x = torch.cat([x1, x2], dim=1)
+        reduce_dims = tuple(range(2, x.dim()))
+
+        mean_x = torch.mean(x, dim=reduce_dims, keepdim=True)
         if self.use_max:
-            # 全局最大池化
-            max_x = torch.amax(x, dim=[2, 3, 4], keepdim=True) # shape: (B, 2C, 1, 1, 1)
+            max_x = torch.amax(x, dim=reduce_dims, keepdim=True)
             mean_x += max_x
         x = mean_x
-        # 投影
-        # 将channel变为最后一个维度。
-        x = x.permute(0, 2, 3, 4, 1)  # shape: (B, 1, 1, 1, 2C)
-        x = self.projection(x)  # shape: (B, 1, 1, 1, C)
-        x = x.permute(0, 4, 1, 2, 3)  # shape: (B, C, 1, 1, 1)
-        # softmax
-        x = self.nonlin(x)  # shape: (B, C, 1, 1, 1)
+
+        if self.proj_type == 'conv':
+            # Conv expects channels-first tensor.
+            x = self.projection(x)
+        else:
+            # Linear/KAN expects channels-last tensor.
+            permute_to_last = [0] + list(range(2, x.dim())) + [1]
+            x = x.permute(*permute_to_last)
+            x = self.projection(x)
+            permute_back = [0, x.dim() - 1] + list(range(1, x.dim() - 1))
+            x = x.permute(*permute_back)
+
+        x = self.nonlin(x)
         y = 1 - x
-        x1 = x1 * x  # shape: (B, C, H, W, D)
-        x2 = x2 * y  # shape: (B, C, H, W, D)
+        x1 = x1 * x
+        x2 = x2 * y
         return x1 + x2
+
 
 class MultiScaleFusionBlock(nn.Module):
 
@@ -127,7 +128,7 @@ class MultiScaleFusionBlock(nn.Module):
             x = self.mlp(x)
             x = helper.channel_to_the_second(x)
 
-        # 将 x 还原为之前的列表。
+        # Restore x back to skip list.
         feature_sum = 0
         for i, feature in enumerate(self.features):
             skip = x[:, feature_sum:feature_sum+feature]
@@ -136,6 +137,7 @@ class MultiScaleFusionBlock(nn.Module):
             feature_sum += feature
             skips[i] = skip + skips[i]
         return skips
+
 
 if __name__ == '__main__':
     block = MultiScaleFusionBlock([32, 32, 32, 32, 32], nn.Conv3d).cuda()
