@@ -17,7 +17,6 @@ torch._dynamo.config.suppress_errors = True
 os.environ["SENNET_FREEZE_ENHANCER_EPOCHS"] = "20"
 os.environ["SENNET_ENHANCER_CKPT"] = ("/mnt/data4/zr/nnUNet_Datasets/nnUNet_results/Dataset112_MaskedFullAndLocalBLL_171/"
                                       "EnhancementPretrainTrainer__nnUNetPlans__3d_fullres/fold_0/checkpoint_final.pth")
-
 class EnhancedTrainer(SenTrainer):
     """
     第四步：增强模块 + 分割模块联合训练
@@ -48,6 +47,31 @@ class EnhancedTrainer(SenTrainer):
 
     def _do_i_compile(self):
         return False
+    def set_deep_supervision_enabled(self, enabled: bool):
+        """
+        nnUNetTrainer 默认仅为 U-Net 风格网络设置 `decoder.deep_supervision`。
+        EnhancedSegNet 直接读取 `self.deep_supervision`，因此这里需要同步两者，
+        否则推理阶段可能仍输出 deep supervision 列表。
+        """
+        super().set_deep_supervision_enabled(enabled)
+        mod = self.network.module if self.is_ddp else self.network
+        if hasattr(mod, "_orig_mod"):
+            mod = mod._orig_mod
+        if hasattr(mod, "deep_supervision"):
+            mod.deep_supervision = enabled
+
+    def set_deep_supervision_enabled(self, enabled: bool):
+        """
+        nnUNetTrainer 默认仅为 U-Net 风格网络设置 `decoder.deep_supervision`。
+        EnhancedSegNet 直接读取 `self.deep_supervision`，因此这里需要同步两者，
+        否则推理阶段可能仍输出 deep supervision 列表。
+        """
+        super().set_deep_supervision_enabled(enabled)
+        mod = self.network.module if self.is_ddp else self.network
+        if hasattr(mod, "_orig_mod"):
+            mod = mod._orig_mod
+        if hasattr(mod, "deep_supervision"):
+            mod.deep_supervision = enabled
 
     @staticmethod
     def build_network_architecture(

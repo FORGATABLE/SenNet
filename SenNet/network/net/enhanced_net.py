@@ -228,8 +228,11 @@ class EnhancedSegNet(nn.Module):
         seg_outputs = seg_outputs[::-1]
         seg = seg_outputs if self.deep_supervision else seg_outputs[0]
 
-        if not return_aux:
-            return seg
+        if not return_aux :
+            if self.training:
+                return seg
+            else:
+                return seg[0]
 
         return {
             "seg": seg,
