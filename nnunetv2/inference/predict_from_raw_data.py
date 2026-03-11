@@ -889,6 +889,7 @@ def predict_entry_point():
                                 verbose=args.verbose,
                                 verbose_preprocessing=args.verbose,
                                 allow_tqdm=not args.disable_progress_bar)
+    print(join(model_folder, f'fold_{args.f}', args.chk))
     predictor.initialize_from_trained_model_folder(
         model_folder,
         args.f,
