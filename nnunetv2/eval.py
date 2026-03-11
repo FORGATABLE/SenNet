@@ -17,9 +17,9 @@ import torch
 import torch.nn.functional as F
 import pandas as pd
 from typing import List, Union, Tuple
-import GeodisTK
+# import GeodisTK
 from scipy import ndimage
-from scipy.ndimage import binary_erosion
+from scipy.ndimage import binary_erosion, distance_transform_edt
 
 
 # 手写豪斯多夫距离计算
@@ -37,46 +37,92 @@ def get_edge_points(img):
     return edge
 
 
+# def binary_hausdorff95(s, g, spacing=None):
+#     """
+#     get the hausdorff distance between a binary segmentation and the ground truth
+#     inputs:
+#         s: a 3D or 2D binary image for segmentation
+#         g: a 2D or 2D binary image for ground truth
+#         spacing: a list for image spacing, length should be 3 or 2
+#     """
+#     s_edge = get_edge_points(s)
+#     g_edge = get_edge_points(g)
+#     image_dim = len(s.shape)
+#     assert image_dim == len(g.shape)
+#     if spacing == None:
+#         spacing = [1.0] * image_dim
+#     else:
+#         assert image_dim == len(spacing)
+#     img = np.zeros_like(s)
+#     if image_dim == 2:
+#         s_dis = GeodisTK.geodesic2d_raster_scan(img, s_edge, 0.0, 2)
+#         g_dis = GeodisTK.geodesic2d_raster_scan(img, g_edge, 0.0, 2)
+#     elif image_dim == 3:
+#         s_dis = GeodisTK.geodesic3d_raster_scan(img, s_edge, spacing, 0.0, 2)
+#         g_dis = GeodisTK.geodesic3d_raster_scan(img, g_edge, spacing, 0.0, 2)
+#
+#     dist_list1 = s_dis[g_edge > 0]
+#     dist_list1 = sorted(dist_list1)
+#     if len(dist_list1) == 0:
+#         dist1 = 0
+#         dist3 = 0
+#     else:
+#         dist1 = dist_list1[int(len(dist_list1) * 0.95)]
+#         dist3 = dist_list1[int(len(dist_list1))-1]
+#     dist_list2 = g_dis[s_edge > 0]
+#     dist_list2 = sorted(dist_list2)
+#     if len(dist_list2) == 0:
+#         return 0, 0
+#     else:
+#         dist2 = dist_list2[int(len(dist_list2) * 0.95)]
+#         dist4 = dist_list2[int(len(dist_list2))-1]
+#         return max(dist1, dist2), max(dist3, dist4)
 def binary_hausdorff95(s, g, spacing=None):
     """
     get the hausdorff distance between a binary segmentation and the ground truth
     inputs:
         s: a 3D or 2D binary image for segmentation
-        g: a 2D or 2D binary image for ground truth
-        spacing: a list for image spacing, length should be 3 or 2
+        g: a 3D or 2D binary image for ground truth
+        spacing: a list/tuple for image spacing, length should be 3 or 2
+    returns:
+        hd95, hd100
     """
-    s_edge = get_edge_points(s)
-    g_edge = get_edge_points(g)
+    s = np.asarray(s).astype(bool)
+    g = np.asarray(g).astype(bool)
+
     image_dim = len(s.shape)
     assert image_dim == len(g.shape)
-    if spacing == None:
+
+    if spacing is None:
         spacing = [1.0] * image_dim
     else:
         assert image_dim == len(spacing)
-    img = np.zeros_like(s)
-    if image_dim == 2:
-        s_dis = GeodisTK.geodesic2d_raster_scan(img, s_edge, 0.0, 2)
-        g_dis = GeodisTK.geodesic2d_raster_scan(img, g_edge, 0.0, 2)
-    elif image_dim == 3:
-        s_dis = GeodisTK.geodesic3d_raster_scan(img, s_edge, spacing, 0.0, 2)
-        g_dis = GeodisTK.geodesic3d_raster_scan(img, g_edge, spacing, 0.0, 2)
 
-    dist_list1 = s_dis[g_edge > 0]
-    dist_list1 = sorted(dist_list1)
-    if len(dist_list1) == 0:
-        dist1 = 0
-        dist3 = 0
-    else:
-        dist1 = dist_list1[int(len(dist_list1) * 0.95)]
-        dist3 = dist_list1[int(len(dist_list1))-1]
-    dist_list2 = g_dis[s_edge > 0]
-    dist_list2 = sorted(dist_list2)
-    if len(dist_list2) == 0:
-        return 0, 0
-    else:
-        dist2 = dist_list2[int(len(dist_list2) * 0.95)]
-        dist4 = dist_list2[int(len(dist_list2))-1]
-        return max(dist1, dist2), max(dist3, dist4)
+    s_edge = get_edge_points(s).astype(bool)
+    g_edge = get_edge_points(g).astype(bool)
+
+    if not np.any(s_edge) and not np.any(g_edge):
+        return 0.0, 0.0
+    if not np.any(s_edge) or not np.any(g_edge):
+        return float("inf"), float("inf")
+
+    s_dist_map = distance_transform_edt(~s_edge, sampling=spacing)
+    g_dist_map = distance_transform_edt(~g_edge, sampling=spacing)
+
+    dist_list1 = s_dist_map[g_edge]
+    dist_list2 = g_dist_map[s_edge]
+
+    if len(dist_list1) == 0 and len(dist_list2) == 0:
+        return 0.0, 0.0
+    if len(dist_list1) == 0 or len(dist_list2) == 0:
+        return float("inf"), float("inf")
+
+    hd95_1 = np.percentile(dist_list1, 95)
+    hd95_2 = np.percentile(dist_list2, 95)
+    hd_1 = np.max(dist_list1)
+    hd_2 = np.max(dist_list2)
+
+    return float(max(hd95_1, hd95_2)), float(max(hd_1, hd_2))
 def getBestAndWorst(metrics_list):
     """
     :param metrics_list: list of metrics
