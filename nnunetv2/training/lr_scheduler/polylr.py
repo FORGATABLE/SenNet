@@ -9,7 +9,10 @@ class PolyLRScheduler(_LRScheduler):
         self.exponent = exponent
         self.ctr = 0
         super().__init__(optimizer, current_step if current_step is not None else -1, False)
-
+        """
+        Sensen:新版本的pytorch需要修改
+        """
+        # super().__init__(optimizer, current_step if current_step is not None else -1)
     def step(self, current_step=None):
         if current_step is None or current_step == -1:
             current_step = self.ctr
