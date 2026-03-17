@@ -39,7 +39,8 @@ class FDMEnhancedPreTrainer(SenTrainer):
     ):
         super().__init__(plans, configuration, fold, dataset_json, unpack_dataset, device)
         self._best_val_loss = None
-        self.num_epochs = 20
+        self.num_epochs = 50
+        self.initial_lr = 5e-3
         self.enable_deep_supervision = False
         self.enhancement_loss = FDMEnhancementLoss(
             lambda_rec=1.0,

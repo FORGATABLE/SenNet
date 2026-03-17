@@ -63,6 +63,17 @@ class FDMEnhancementLoss(nn.Module):
         enhanced = model_output["enhanced"]
         residual = model_output["residual"]
 
+        if enhanced.shape != raw_img.shape:
+            raise ValueError(
+                f"FDM enhancer must output an image-shaped enhanced volume. Got enhanced={tuple(enhanced.shape)} "
+                f"and raw_img={tuple(raw_img.shape)}"
+            )
+        if residual.shape != raw_img.shape:
+            raise ValueError(
+                f"FDM enhancer residual must match the raw image shape. Got residual={tuple(residual.shape)} "
+                f"and raw_img={tuple(raw_img.shape)}"
+            )
+
         rec = F.l1_loss(enhanced, raw_img)
         edge = F.l1_loss(torch.abs(laplace_response_3d(enhanced)), torch.abs(laplace_response_3d(raw_img)))
         freq = F.l1_loss(high_frequency_map(enhanced), high_frequency_map(raw_img))
@@ -117,12 +128,14 @@ class DiceCELoss(nn.Module):
 class BoundaryLoss(nn.Module):
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         target = _prepare_target(target, logits)
-        probs = torch.softmax(logits, dim=1)
-        target_onehot = _one_hot(target, logits.shape[1])
+        with torch.autocast(device_type=logits.device.type, enabled=False):
+            probs = torch.softmax(logits.float(), dim=1)
+            target_onehot = _one_hot(target, logits.shape[1]).float()
 
-        pred_boundary = _boundary_map(probs[:, 1:])
-        target_boundary = _boundary_map(target_onehot[:, 1:])
-        return F.binary_cross_entropy(pred_boundary.clamp(1e-6, 1 - 1e-6), target_boundary)
+            pred_boundary = _boundary_map(probs[:, 1:])
+            target_boundary = _boundary_map(target_onehot[:, 1:])
+            loss = F.binary_cross_entropy(pred_boundary.clamp(1e-6, 1 - 1e-6), target_boundary)
+        return loss
 
 
 class AnatomicalDistanceLoss(nn.Module):

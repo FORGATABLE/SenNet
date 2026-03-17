@@ -772,6 +772,7 @@ class FrequencyEnhancementBackbone(nn.Module):
         self.activation = nn.Tanh()
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        raw_input = x
         shallow = self.shallow_encoder(self.input_proj(x))
         low_level = self.low_freq_transform(self.down1(shallow))
         bottleneck = self.bottleneck_transform(self.down2(low_level))
@@ -781,4 +782,5 @@ class FrequencyEnhancementBackbone(nn.Module):
         x = self.reconstruct(x)
 
         residual = self.activation(self.out_proj(x))
-        return x + residual, residual
+        enhanced = raw_input + residual
+        return enhanced, residual

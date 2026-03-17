@@ -10,12 +10,8 @@ from torch import nn
 
 from SenNet.network.losses.FDM_hybridLoss import FDMHybridLoss
 from SenNet.trainer.trainers import SenTrainer
-
-try:
-    from SenNet.network.net.FDM_Net import FDMNet
-except Exception:
-    FDMNet = None
-
+from SenNet.network.net.FDM_Net import FDMNet
+from SenNet.network.net.SF_FDMNet import SFFDMNet
 
 torch._dynamo.config.suppress_errors = True
 
@@ -31,8 +27,10 @@ class FDMTrainer(SenTrainer):
         device: torch.device = torch.device("cuda"),
     ):
         super().__init__(plans, configuration, fold, dataset_json, unpack_dataset, device)
+        # self.enable_deep_supervision = os.environ.get("SENNET_FDM_DEEP_SUPERVISION", "0").lower() in ("1", "true", "yes")
         self.enable_deep_supervision = True
-        self.num_epochs = 150
+        self.initial_lr = 1e-4
+        self.num_epochs = 300
         self.pretrained_enhancer_ckpt = os.environ.get(
             "SENNET_FDM_ENHANCER_CKPT",
             os.environ.get("SENNET_ENHANCER_CKPT", None),
@@ -42,7 +40,7 @@ class FDMTrainer(SenTrainer):
                 os.environ.get("SENNET_FDM_FREEZE_EPOCHS", os.environ.get("SENNET_FREEZE_ENHANCER_EPOCHS", "20"))
             )
         except Exception:
-            self.freeze_enhancer_epochs = 20
+            self.freeze_enhancer_epochs = 10
         self._enhancer_ckpt_loaded = False
         self._enhancer_is_frozen = None
 
@@ -56,6 +54,8 @@ class FDMTrainer(SenTrainer):
         return network
 
     def set_deep_supervision_enabled(self, enabled: bool):
+        if os.environ.get("SENNET_FDM_DEEP_SUPERVISION", "0").lower() not in ("1", "true", "yes"):
+            enabled = False
         super().set_deep_supervision_enabled(enabled)
         network = self._get_network_module()
         if hasattr(network, "deep_supervision"):
@@ -98,12 +98,14 @@ class FDMTrainer(SenTrainer):
                 weights = weights / weights.sum()
                 deep_supervision_weights = weights.tolist()
 
+        lambda_boundary = 0.2
+        lambda_anatomy = 0.1
         return FDMHybridLoss(
             deep_supervision=self.enable_deep_supervision,
             deep_supervision_weights=deep_supervision_weights,
             lambda_seg=1.0,
-            lambda_boundary=0.2,
-            lambda_anatomy=0.1,
+            lambda_boundary=lambda_boundary,
+            lambda_anatomy=lambda_anatomy,
         )
 
     def initialize(self):
@@ -124,7 +126,7 @@ class FDMTrainer(SenTrainer):
             self.print_to_log_file(f"[WARN] enhancer checkpoint not found: {ckpt_path}")
             return
 
-        checkpoint = torch.load(ckpt_path, map_location="cpu")
+        checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         state_dict = self._extract_state_dict(checkpoint)
 
         cleaned = {}
@@ -259,3 +261,35 @@ class FDMTrainer(SenTrainer):
             if key in losses:
                 result[key] = float(losses[key].detach().cpu())
         return result
+class SFFDMTrainer(FDMTrainer):
+    @staticmethod
+    def build_network_architecture(
+        architecture_class_name: str,
+        arch_init_kwargs: dict,
+        arch_init_kwargs_req_import: Union[List[str], Tuple[str, ...]],
+        num_input_channels: int,
+        num_output_channels: int,
+        enable_deep_supervision: bool = True,
+    ) -> nn.Module:
+        if SFFDMNet is None:
+            raise ImportError('SFFDMNet is not available. Please ensure SenNet/network/net/SF_FDMNet.py exists.')
+        architecture_kwargs = FDMTrainer.update_network_args(
+            arch_init_kwargs,
+            arch_init_kwargs_req_import,
+            num_input_channels,
+            num_output_channels,
+            enable_deep_supervision,
+            print_args=True,
+        )
+        network = SFFDMNet(**architecture_kwargs)
+        if hasattr(network, 'initialize'):
+            network.apply(network.initialize)
+        return network
+if __name__ == "__main__":
+    # trainer = FDMTrainer(plans={}, configuration="FDM", fold=0, dataset_json={})
+    # trainer.initialize()
+    """
+    export SENNET_FDM_ENHANCER_CKPT=/path/to/checkpoint_best.pth
+    export SENNET_FDM_FREEZE_EPOCHS=20
+    nnUNetv2_train DATASET_ID 3d_fullres FOLD -tr FDMTrainer
+    """

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from typing import List, Optional, Sequence, Tuple, Type
 
@@ -11,12 +11,56 @@ from SenNet.network.common.FDM_blocks import (
     DynamicMultiScaleInputBlock,
     FrequencyEnhancementBackbone,
     HybridEncoderStage,
-    UpBlock,
+    ResidualConvBlock,
+    match_tensor_to_reference,
 )
-from SenNet.network.common.helper import InitWeights_He
+from SenNet.network.common.helper import InitWeights_He, get_matching_convtransp
+from SenNet.network.net.fushion_blocks import SelectiveFusionBlock
 
 
-class FDMNet(nn.Module):
+class SelectiveSkipUpBlock(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        conv_op: Type[_ConvNd],
+        conv_bias: bool = True,
+        norm_op: Optional[Type[nn.Module]] = None,
+        norm_op_kwargs: Optional[dict] = None,
+        nonlin: Optional[Type[nn.Module]] = None,
+        nonlin_kwargs: Optional[dict] = None,
+        proj_type: str = 'mlp',
+        use_max: bool = True,
+    ) -> None:
+        super().__init__()
+        transp = get_matching_convtransp(conv_op=conv_op)
+        self.up = transp(in_channels, out_channels, kernel_size=2, stride=2, bias=conv_bias)
+        self.selective_fusion = SelectiveFusionBlock(
+            channels=out_channels,
+            conv_op=conv_op,
+            proj_type=proj_type,
+            use_max=use_max,
+        )
+        self.refine = ResidualConvBlock(
+            out_channels * 2,
+            out_channels,
+            conv_op,
+            conv_bias=conv_bias,
+            norm_op=norm_op,
+            norm_op_kwargs=norm_op_kwargs,
+            nonlin=nonlin,
+            nonlin_kwargs=nonlin_kwargs,
+        )
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = self.up(x)
+        x = match_tensor_to_reference(x, skip)
+        selective_skip = self.selective_fusion(skip, x)
+        x = torch.cat([x, selective_skip], dim=1)
+        return self.refine(x)
+
+
+class SFFDMNet(nn.Module):
     def __init__(
         self,
         input_channels: int,
@@ -132,7 +176,7 @@ class FDMNet(nn.Module):
         self.seg_heads = nn.ModuleList()
         for stage_idx in range(n_stages - 1, 0, -1):
             self.decoder.append(
-                UpBlock(
+                SelectiveSkipUpBlock(
                     features_per_stage[stage_idx],
                     features_per_stage[stage_idx - 1],
                     conv_op,
@@ -141,6 +185,8 @@ class FDMNet(nn.Module):
                     norm_op_kwargs=norm_op_kwargs,
                     nonlin=nonlin,
                     nonlin_kwargs=nonlin_kwargs,
+                    proj_type='mlp',
+                    use_max=True,
                 )
             )
             self.seg_heads.append(
@@ -165,7 +211,6 @@ class FDMNet(nn.Module):
         return skips, fused
 
     def forward(self, x: torch.Tensor, return_aux: bool = False):
-        # todo：可以考虑只用残差做增强
         enhanced, residual = self.enhancer(x)
         skips, bottleneck = self._encode(x, enhanced)
 
@@ -182,7 +227,7 @@ class FDMNet(nn.Module):
             return seg
 
         return {
-            "seg": seg,
-            "enhanced": enhanced,
-            "residual": residual,
+            'seg': seg,
+            'enhanced': enhanced,
+            'residual': residual,
         }
