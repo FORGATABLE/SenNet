@@ -7,12 +7,12 @@ import numpy as np
 import torch
 import torch._dynamo
 from torch import nn
-
+from SenNet.network.net.SFFDTM_Net import SFFDTMNet
 from SenNet.network.losses.FDM_hybridLoss import FDMHybridLoss
 from SenNet.trainer.trainers import SenTrainer
 from SenNet.network.net.FDM_Net import FDMNet
 from SenNet.network.net.SF_FDMNet import SFFDMNet
-
+from SenNet.network.net.FDTM_Net import FDTMNet
 torch._dynamo.config.suppress_errors = True
 
 
@@ -30,7 +30,7 @@ class FDMTrainer(SenTrainer):
         # self.enable_deep_supervision = os.environ.get("SENNET_FDM_DEEP_SUPERVISION", "0").lower() in ("1", "true", "yes")
         self.enable_deep_supervision = True
         self.initial_lr = 1e-4
-        self.num_epochs = 300
+        self.num_epochs = 150
         self.pretrained_enhancer_ckpt = os.environ.get(
             "SENNET_FDM_ENHANCER_CKPT",
             os.environ.get("SENNET_ENHANCER_CKPT", None),
@@ -262,6 +262,21 @@ class FDMTrainer(SenTrainer):
                 result[key] = float(losses[key].detach().cpu())
         return result
 class SFFDMTrainer(FDMTrainer):
+    """"
+    跳跃连接加入特征选择模块
+    """
+    def __init__(
+            self,
+            plans: dict,
+            configuration: str,
+            fold: int,
+            dataset_json: dict,
+            unpack_dataset: bool = True,
+            device: torch.device = torch.device("cuda"),
+    ):
+        super().__init__(plans, configuration, fold, dataset_json, unpack_dataset, device)
+        self.initial_lr = 0.0005
+        self.num_epochs = 200
     @staticmethod
     def build_network_architecture(
         architecture_class_name: str,
@@ -285,6 +300,77 @@ class SFFDMTrainer(FDMTrainer):
         if hasattr(network, 'initialize'):
             network.apply(network.initialize)
         return network
+
+class FDTMTrainer(FDMTrainer):
+
+    """
+        修改mamba模块加入GSC和LayerNorm
+    """
+    @staticmethod
+    def build_network_architecture(
+        architecture_class_name: str,
+        arch_init_kwargs: dict,
+        arch_init_kwargs_req_import: Union[List[str], Tuple[str, ...]],
+        num_input_channels: int,
+        num_output_channels: int,
+        enable_deep_supervision: bool = True,
+    ) -> nn.Module:
+        if FDTMNet is None:
+            raise ImportError('FDTMNet is not available. Please ensure SenNet/network/net/FDTM_Net.py exists.')
+        architecture_kwargs = FDMTrainer.update_network_args(
+            arch_init_kwargs,
+            arch_init_kwargs_req_import,
+            num_input_channels,
+            num_output_channels,
+            enable_deep_supervision,
+            print_args=True,
+        )
+        network = FDTMNet(**architecture_kwargs)
+        if hasattr(network, 'initialize'):
+            network.apply(network.initialize)
+        return network
+
+class SFFDTMTrainer(FDTMTrainer):
+    """
+    FDTM + 特征选择模块
+    """
+
+    def __init__(
+            self,
+            plans: dict,
+            configuration: str,
+            fold: int,
+            dataset_json: dict,
+            unpack_dataset: bool = True,
+            device: torch.device = torch.device("cuda"),
+    ):
+        super().__init__(plans, configuration, fold, dataset_json, unpack_dataset, device)
+        self.initial_lr = 0.0005
+        self.num_epochs = 200
+    @staticmethod
+    def build_network_architecture(
+        architecture_class_name: str,
+        arch_init_kwargs: dict,
+        arch_init_kwargs_req_import: Union[List[str], Tuple[str, ...]],
+        num_input_channels: int,
+        num_output_channels: int,
+        enable_deep_supervision: bool = True,
+    ) -> nn.Module:
+        if SFFDTMNet is None:
+            raise ImportError('SFFDTMNet is not available. Please ensure SenNet/network/net/SFFDTM_Net.py exists.')
+        architecture_kwargs = FDTMTrainer.update_network_args(
+            arch_init_kwargs,
+            arch_init_kwargs_req_import,
+            num_input_channels,
+            num_output_channels,
+            enable_deep_supervision,
+            print_args=True,
+        )
+        network = SFFDTMNet(**architecture_kwargs)
+        if hasattr(network, 'initialize'):
+            network.apply(network.initialize)
+        return network
+
 if __name__ == "__main__":
     # trainer = FDMTrainer(plans={}, configuration="FDM", fold=0, dataset_json={})
     # trainer.initialize()

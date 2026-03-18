@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from typing import List, Optional, Sequence, Tuple, Type
 
@@ -13,10 +13,11 @@ from SenNet.network.common.FDM_blocks import (
     HybridEncoderStage,
     UpBlock,
 )
+from SenNet.network.common.FDTM_blocks import FDTMSegMambaEncoderStage
 from SenNet.network.common.helper import InitWeights_He
 
 
-class FDMNet(nn.Module):
+class FDTMNet(nn.Module):
     def __init__(
         self,
         input_channels: int,
@@ -85,7 +86,7 @@ class FDMNet(nn.Module):
                     nonlin=nonlin,
                     nonlin_kwargs=nonlin_kwargs,
                 )
-            else:
+            elif stage_idx < mamba_from_stage:
                 raw_stage = HybridEncoderStage(
                     prev_raw,
                     out_channels,
@@ -96,7 +97,7 @@ class FDMNet(nn.Module):
                     norm_op_kwargs=norm_op_kwargs,
                     nonlin=nonlin,
                     nonlin_kwargs=nonlin_kwargs,
-                    use_mamba=use_mamba,
+                    use_mamba=False,
                 )
                 enh_stage = HybridEncoderStage(
                     prev_enh,
@@ -108,7 +109,33 @@ class FDMNet(nn.Module):
                     norm_op_kwargs=norm_op_kwargs,
                     nonlin=nonlin,
                     nonlin_kwargs=nonlin_kwargs,
-                    use_mamba=use_mamba,
+                    use_mamba=False,
+                )
+            else:
+                num_blocks = n_conv_per_stage[stage_idx] if stage_idx < len(n_conv_per_stage) else 1
+                raw_stage = FDTMSegMambaEncoderStage(
+                    prev_raw,
+                    out_channels,
+                    conv_op,
+                    stride=strides[stage_idx],
+                    conv_bias=conv_bias,
+                    norm_op=norm_op,
+                    norm_op_kwargs=norm_op_kwargs,
+                    nonlin=nonlin,
+                    nonlin_kwargs=nonlin_kwargs,
+                    num_mamba_blocks=num_blocks,
+                )
+                enh_stage = FDTMSegMambaEncoderStage(
+                    prev_enh,
+                    out_channels,
+                    conv_op,
+                    stride=strides[stage_idx],
+                    conv_bias=conv_bias,
+                    norm_op=norm_op,
+                    norm_op_kwargs=norm_op_kwargs,
+                    nonlin=nonlin,
+                    nonlin_kwargs=nonlin_kwargs,
+                    num_mamba_blocks=num_blocks,
                 )
 
             self.raw_encoder.append(raw_stage)
@@ -165,7 +192,6 @@ class FDMNet(nn.Module):
         return skips, fused
 
     def forward(self, x: torch.Tensor, return_aux: bool = False):
-        # todo：可以考虑只用残差做增强
         enhanced, residual = self.enhancer(x)
         skips, bottleneck = self._encode(x, residual)
 
@@ -182,7 +208,7 @@ class FDMNet(nn.Module):
             return seg
 
         return {
-            "seg": seg,
-            "enhanced": enhanced,
-            "residual": residual,
+            'seg': seg,
+            'enhanced': enhanced,
+            'residual': residual,
         }
