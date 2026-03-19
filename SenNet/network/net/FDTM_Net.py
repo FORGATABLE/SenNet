@@ -193,7 +193,7 @@ class FDTMNet(nn.Module):
 
     def forward(self, x: torch.Tensor, return_aux: bool = False):
         enhanced, residual = self.enhancer(x)
-        skips, bottleneck = self._encode(x, residual)
+        skips, bottleneck = self._encode(x, enhanced)
 
         decoder_outputs: List[torch.Tensor] = []
         x_dec = bottleneck

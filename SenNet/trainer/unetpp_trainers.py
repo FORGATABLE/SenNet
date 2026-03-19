@@ -13,6 +13,8 @@ class UNetPPTrainer(SenTrainer):
                  device: torch.device = torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, unpack_dataset, device)
         self.enable_deep_supervision = False
+        self.num_epochs = 300
+        self.initial_lr = 1e-3
 
     @staticmethod
     def build_network_architecture(architecture_class_name: str,

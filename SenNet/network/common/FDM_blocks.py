@@ -771,6 +771,19 @@ class FrequencyEnhancementBackbone(nn.Module):
         self.out_proj = conv_op(c1, in_channels, kernel_size=1, bias=True)
         self.activation = nn.Tanh()
 
+    def _build_body_mask(self, raw_input: torch.Tensor) -> torch.Tensor:
+        spatial_dims = tuple(range(2, raw_input.ndim))
+        detached = raw_input.detach()
+        min_value = torch.amin(detached, dim=spatial_dims, keepdim=True)
+        max_value = torch.amax(detached, dim=spatial_dims, keepdim=True)
+        threshold = min_value + 0.08 * (max_value - min_value)
+
+        mask = (detached > threshold).to(dtype=raw_input.dtype)
+        mask = F.max_pool3d(mask, kernel_size=5, stride=1, padding=2)
+        mask = F.avg_pool3d(mask, kernel_size=5, stride=1, padding=2)
+        mask = (mask > 0.1).to(dtype=raw_input.dtype)
+        return mask
+
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         raw_input = x
         shallow = self.shallow_encoder(self.input_proj(x))
@@ -782,5 +795,7 @@ class FrequencyEnhancementBackbone(nn.Module):
         x = self.reconstruct(x)
 
         residual = self.activation(self.out_proj(x))
+        body_mask = self._build_body_mask(raw_input)
+        residual = residual * body_mask
         enhanced = raw_input + residual
         return enhanced, residual

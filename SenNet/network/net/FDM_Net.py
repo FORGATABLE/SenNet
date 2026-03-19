@@ -1,6 +1,4 @@
-﻿from __future__ import annotations
-
-from typing import List, Optional, Sequence, Tuple, Type
+﻿from typing import List, Optional, Sequence, Tuple, Type
 
 import torch
 from torch import nn
@@ -167,7 +165,7 @@ class FDMNet(nn.Module):
     def forward(self, x: torch.Tensor, return_aux: bool = False):
         # todo：可以考虑只用残差做增强
         enhanced, residual = self.enhancer(x)
-        skips, bottleneck = self._encode(x, residual)
+        skips, bottleneck = self._encode(x, enhanced)
 
         decoder_outputs: List[torch.Tensor] = []
         x_dec = bottleneck

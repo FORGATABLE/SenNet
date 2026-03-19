@@ -60,18 +60,18 @@ class FDMEnhancementLoss(nn.Module):
         self.lambda_res = lambda_res
 
     def forward(self, model_output: Dict[str, torch.Tensor], raw_img: torch.Tensor) -> Dict[str, torch.Tensor]:
-        enhanced = model_output["enhanced"]
-        residual = model_output["residual"]
+        enhanced = model_output['enhanced']
+        residual = model_output['residual']
 
         if enhanced.shape != raw_img.shape:
             raise ValueError(
-                f"FDM enhancer must output an image-shaped enhanced volume. Got enhanced={tuple(enhanced.shape)} "
-                f"and raw_img={tuple(raw_img.shape)}"
+                f'FDM enhancer must output an image-shaped enhanced volume. Got enhanced={tuple(enhanced.shape)} '
+                f'and raw_img={tuple(raw_img.shape)}'
             )
         if residual.shape != raw_img.shape:
             raise ValueError(
-                f"FDM enhancer residual must match the raw image shape. Got residual={tuple(residual.shape)} "
-                f"and raw_img={tuple(raw_img.shape)}"
+                f'FDM enhancer residual must match the raw image shape. Got residual={tuple(residual.shape)} '
+                f'and raw_img={tuple(raw_img.shape)}'
             )
 
         rec = F.l1_loss(enhanced, raw_img)
@@ -86,12 +86,12 @@ class FDMEnhancementLoss(nn.Module):
             + self.lambda_res * residual_reg
         )
         return {
-            "rec": rec,
-            "edge": edge,
-            "freq": freq,
-            "residual_reg": residual_reg,
-            "total": total,
-            "loss": total,
+            'rec': rec,
+            'edge': edge,
+            'freq': freq,
+            'residual_reg': residual_reg,
+            'total': total,
+            'loss': total,
         }
 
 
@@ -125,30 +125,88 @@ class DiceCELoss(nn.Module):
         return self.dice_weight * dice + self.ce_weight * ce
 
 
-class BoundaryLoss(nn.Module):
+class BoundaryMapBCELoss(nn.Module):
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         target = _prepare_target(target, logits)
         with torch.autocast(device_type=logits.device.type, enabled=False):
             probs = torch.softmax(logits.float(), dim=1)
             target_onehot = _one_hot(target, logits.shape[1]).float()
-
             pred_boundary = _boundary_map(probs[:, 1:])
             target_boundary = _boundary_map(target_onehot[:, 1:])
             loss = F.binary_cross_entropy(pred_boundary.clamp(1e-6, 1 - 1e-6), target_boundary)
         return loss
 
 
+class TraditionalBoundaryLoss(nn.Module):
+    def __init__(self, class_weights: Sequence[float] | None = None) -> None:
+        super().__init__()
+        self.class_weights = list(class_weights) if class_weights is not None else None
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        target = _prepare_target(target, logits)
+        num_classes = logits.shape[1]
+        if num_classes <= 1:
+            return logits.new_tensor(0.0)
+
+        with torch.autocast(device_type=logits.device.type, enabled=False):
+            probs = torch.softmax(logits.float(), dim=1)
+            sdf = _signed_distance_map(target, num_classes).to(device=logits.device, dtype=torch.float32)
+
+            per_class_losses = []
+            for class_idx in range(1, num_classes):
+                current_prob = probs[:, class_idx:class_idx + 1]
+                current_sdf = sdf[:, class_idx:class_idx + 1]
+                per_class_losses.append(torch.mean(current_prob * current_sdf))
+
+            if not per_class_losses:
+                return logits.new_tensor(0.0)
+
+            loss_tensor = torch.stack(per_class_losses)
+            if self.class_weights is None:
+                return loss_tensor.mean()
+
+            if len(self.class_weights) != len(per_class_losses):
+                raise ValueError(
+                    f'class_weights length must match the number of foreground classes. '
+                    f'Got {len(self.class_weights)} weights for {len(per_class_losses)} classes.'
+                )
+            weights = loss_tensor.new_tensor(self.class_weights)
+            weights = weights / (weights.sum() + 1e-8)
+            return torch.sum(loss_tensor * weights)
+
+
+class BoundaryLoss(nn.Module):
+    def __init__(self, mode: str = 'traditional', class_weights: Sequence[float] | None = None) -> None:
+        super().__init__()
+        normalized_mode = mode.lower().strip()
+        if normalized_mode in ('traditional', 'classic', 'kervadec'):
+            self.mode = 'traditional'
+            self.impl = TraditionalBoundaryLoss(class_weights=class_weights)
+        elif normalized_mode in ('map_bce', 'bce', 'edge_bce'):
+            self.mode = 'map_bce'
+            self.impl = BoundaryMapBCELoss()
+        else:
+            raise ValueError(
+                f'Unsupported boundary loss mode: {mode}. Supported modes are traditional and map_bce.'
+            )
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return self.impl(logits, target)
+
+
 class AnatomicalDistanceLoss(nn.Module):
     def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         target = _prepare_target(target, logits)
-        probs = torch.softmax(logits, dim=1)
-        target_onehot = _one_hot(target, logits.shape[1])
-        sdf = _signed_distance_map(target, logits.shape[1])[:, 1:]
-        sdf = sdf.abs()
-        if sdf.numel() > 0:
-            max_per_map = torch.amax(sdf, dim=tuple(range(2, sdf.ndim)), keepdim=True)
-            sdf = sdf / (max_per_map + 1e-6)
-        return torch.mean(torch.abs(probs[:, 1:] - target_onehot[:, 1:]) * (1.0 + sdf))
+        with torch.autocast(device_type=logits.device.type, enabled=False):
+            probs = torch.softmax(logits.float(), dim=1)
+            target_onehot = _one_hot(target, logits.shape[1]).float()
+            sdf = _signed_distance_map(target, logits.shape[1])[:, 1:]
+            sdf = sdf.abs()
+            if sdf.numel() > 0:
+                max_per_map = torch.amax(sdf, dim=tuple(range(2, sdf.ndim)), keepdim=True)
+                sdf = sdf / (max_per_map + 1e-6)
+            loss = torch.mean(torch.abs(probs[:, 1:] - target_onehot[:, 1:]) * (1.0 + sdf))
+        return loss
 
 
 class FDMHybridLoss(nn.Module):
@@ -159,16 +217,19 @@ class FDMHybridLoss(nn.Module):
         lambda_seg: float = 1.0,
         lambda_boundary: float = 0.2,
         lambda_anatomy: float = 0.1,
+        boundary_mode: str = 'traditional',
+        boundary_class_weights: Sequence[float] | None = None,
     ) -> None:
         super().__init__()
         self.seg_loss = DiceCELoss()
-        self.boundary_loss = BoundaryLoss()
+        self.boundary_loss = BoundaryLoss(mode=boundary_mode, class_weights=boundary_class_weights)
         self.anatomy_loss = AnatomicalDistanceLoss()
         self.deep_supervision = deep_supervision
         self.deep_supervision_weights = list(deep_supervision_weights) if deep_supervision_weights is not None else None
         self.lambda_seg = lambda_seg
         self.lambda_boundary = lambda_boundary
         self.lambda_anatomy = lambda_anatomy
+        self.boundary_mode = self.boundary_loss.mode
 
     def _target_for_level(self, target: Union[List[torch.Tensor], torch.Tensor], level: int) -> torch.Tensor:
         if isinstance(target, (list, tuple)):
@@ -201,7 +262,7 @@ class FDMHybridLoss(nn.Module):
         target: Union[List[torch.Tensor], torch.Tensor],
         raw_img: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
-        seg_output = model_output["seg"]
+        seg_output = model_output['seg']
         main_logits = seg_output[0] if isinstance(seg_output, list) else seg_output
         main_target = _to_main_target(target)
 
@@ -211,9 +272,10 @@ class FDMHybridLoss(nn.Module):
 
         total = self.lambda_seg * seg + self.lambda_boundary * bd + self.lambda_anatomy * anat
         return {
-            "seg": seg,
-            "bd": bd,
-            "anat": anat,
-            "total": total,
-            "loss": total,
+            'seg': seg,
+            'bd': bd,
+            'anat': anat,
+            'total': total,
+            'loss': total,
+            'boundary_mode': self.boundary_mode,
         }

@@ -2,16 +2,32 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from itertools import product
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Type
 
+import nnunetv2
 import numpy as np
 import SimpleITK as sitk
 import torch
+from acvl_utils.cropping_and_padding.bounding_boxes import bounding_box_to_slice
 from acvl_utils.cropping_and_padding.padding import pad_nd_image
 from nnunetv2.inference.sliding_window_prediction import compute_gaussian, compute_steps_for_sliding_window
+from nnunetv2.preprocessing.cropping.cropping import crop_to_nonzero
+from nnunetv2.preprocessing.normalization.default_normalization_schemes import (
+    CTNormalization,
+    NoNormalization,
+    RGBTo01Normalization,
+    RescaleTo01Normalization,
+    ZScoreNormalization,
+)
+from nnunetv2.preprocessing.resampling.default_resampling import compute_new_shape
+from nnunetv2.utilities.find_class_by_name import recursive_find_python_class
 from tqdm import tqdm
+
+
+NormalizationState = Dict[str, object]
 
 
 def ensure_dir(path: Path) -> None:
@@ -23,35 +39,12 @@ def load_json(path: Path) -> dict:
         return json.load(f)
 
 
-def load_nii(path: Path) -> Tuple[sitk.Image, np.ndarray]:
-    image = sitk.ReadImage(str(path))
-    array = sitk.GetArrayFromImage(image).astype(np.float32)
-    return image, array
-
-
 def save_nii(array: np.ndarray, ref_image: sitk.Image, out_path: Path) -> None:
     out = sitk.GetImageFromArray(array.astype(np.float32, copy=False))
     out.SetSpacing(ref_image.GetSpacing())
     out.SetOrigin(ref_image.GetOrigin())
     out.SetDirection(ref_image.GetDirection())
     sitk.WriteImage(out, str(out_path), True)
-
-
-def normalize_volume(array: np.ndarray) -> Tuple[np.ndarray, float, float]:
-    mean = float(array.mean())
-    std = float(array.std())
-    if std < 1e-8:
-        std = 1.0
-    normalized = (array - mean) / std
-    return normalized.astype(np.float32, copy=False), mean, std
-
-
-def denormalize_volume(array: np.ndarray, mean: float, std: float) -> np.ndarray:
-    return array * std + mean
-
-
-def denormalize_residual(array: np.ndarray, std: float) -> np.ndarray:
-    return array * std
 
 
 def extract_state_dict(checkpoint):
@@ -72,6 +65,224 @@ def clean_state_dict_keys(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torc
             new_key = new_key[8:]
         cleaned[new_key] = value
     return cleaned
+
+
+def _get_normalizer_class(scheme: str):
+    normalizer_class = recursive_find_python_class(
+        os.path.join(nnunetv2.__path__[0], 'preprocessing', 'normalization'),
+        scheme,
+        'nnunetv2.preprocessing.normalization',
+    )
+    if normalizer_class is None:
+        raise RuntimeError(f'Unable to locate normalization class: {scheme}')
+    return normalizer_class
+
+
+def _normalize_channel_like_nnunet(
+    image: np.ndarray,
+    seg: np.ndarray,
+    normalizer_class,
+    use_mask_for_norm: bool,
+    intensityproperties: dict,
+) -> Tuple[np.ndarray, NormalizationState]:
+    image = image.astype(np.float32, copy=True)
+
+    if issubclass(normalizer_class, CTNormalization):
+        mean_intensity = float(intensityproperties['mean'])
+        std_intensity = float(max(intensityproperties['std'], 1e-8))
+        lower_bound = float(intensityproperties['percentile_00_5'])
+        upper_bound = float(intensityproperties['percentile_99_5'])
+        np.clip(image, lower_bound, upper_bound, out=image)
+        image -= mean_intensity
+        image /= std_intensity
+        state: NormalizationState = {
+            'type': 'ct',
+            'mean': mean_intensity,
+            'std': std_intensity,
+        }
+        return image, state
+
+    if issubclass(normalizer_class, ZScoreNormalization):
+        if use_mask_for_norm:
+            mask = seg >= 0
+            if np.any(mask):
+                mean = float(image[mask].mean())
+                std = float(max(image[mask].std(), 1e-8))
+                image[mask] = (image[mask] - mean) / std
+            else:
+                mean = float(image.mean())
+                std = float(max(image.std(), 1e-8))
+                image -= mean
+                image /= std
+                mask = None
+        else:
+            mean = float(image.mean())
+            std = float(max(image.std(), 1e-8))
+            image -= mean
+            image /= std
+            mask = None
+        state = {
+            'type': 'zscore',
+            'mean': mean,
+            'std': std,
+            'mask': mask,
+        }
+        return image, state
+
+    if issubclass(normalizer_class, NoNormalization):
+        return image, {'type': 'identity'}
+
+    if issubclass(normalizer_class, RescaleTo01Normalization):
+        min_value = float(image.min())
+        max_value = float(image.max())
+        scale = float(max(max_value - min_value, 1e-8))
+        image -= min_value
+        image /= scale
+        return image, {'type': 'rescale01', 'min': min_value, 'scale': scale}
+
+    if issubclass(normalizer_class, RGBTo01Normalization):
+        image /= 255.0
+        return image, {'type': 'rgb01', 'scale': 255.0}
+
+    raise NotImplementedError(
+        f'Enhancement inference does not support inverse normalization for custom scheme {normalizer_class.__name__}.'
+    )
+
+
+def _invert_normalization(
+    array: np.ndarray,
+    states: List[NormalizationState],
+    output_kind: str,
+) -> np.ndarray:
+    restored = array.astype(np.float32, copy=True)
+    for channel_idx, state in enumerate(states):
+        state_type = state['type']
+        if state_type == 'identity':
+            continue
+
+        if state_type == 'ct':
+            std = float(state['std'])
+            if output_kind == 'enhanced':
+                restored[channel_idx] = restored[channel_idx] * std + float(state['mean'])
+            else:
+                restored[channel_idx] = restored[channel_idx] * std
+            continue
+
+        if state_type == 'zscore':
+            std = float(state['std'])
+            mean = float(state['mean'])
+            mask = state.get('mask', None)
+            if mask is None:
+                if output_kind == 'enhanced':
+                    restored[channel_idx] = restored[channel_idx] * std + mean
+                else:
+                    restored[channel_idx] = restored[channel_idx] * std
+            else:
+                mask = np.asarray(mask, dtype=bool)
+                if output_kind == 'enhanced':
+                    restored[channel_idx][mask] = restored[channel_idx][mask] * std + mean
+                else:
+                    restored[channel_idx][mask] = restored[channel_idx][mask] * std
+            continue
+
+        if state_type == 'rescale01':
+            scale = float(state['scale'])
+            if output_kind == 'enhanced':
+                restored[channel_idx] = restored[channel_idx] * scale + float(state['min'])
+            else:
+                restored[channel_idx] = restored[channel_idx] * scale
+            continue
+
+        if state_type == 'rgb01':
+            restored[channel_idx] = restored[channel_idx] * float(state['scale'])
+            continue
+
+        raise RuntimeError(f'Unsupported normalization state type: {state_type}')
+    return restored
+
+
+def preprocess_case_like_nnunet(
+    case_path: Path,
+    plans_manager,
+    configuration_manager,
+    dataset_json: dict,
+) -> Dict[str, object]:
+    rw = plans_manager.image_reader_writer_class()
+    data, properties = rw.read_images([str(case_path)])
+    properties = dict(properties)
+
+    data = data.astype(np.float32, copy=True)
+    transpose_forward = [0, *[i + 1 for i in plans_manager.transpose_forward]]
+    data = data.transpose(transpose_forward)
+
+    original_spacing = [properties['spacing'][i] for i in plans_manager.transpose_forward]
+    properties['shape_before_cropping'] = data.shape[1:]
+
+    data, pseudo_seg, bbox = crop_to_nonzero(data, seg=None)
+    properties['bbox_used_for_cropping'] = bbox
+    properties['shape_after_cropping_and_before_resampling'] = data.shape[1:]
+
+    normalization_states: List[NormalizationState] = []
+    for channel_idx in range(data.shape[0]):
+        normalizer_class = _get_normalizer_class(configuration_manager.normalization_schemes[channel_idx])
+        data[channel_idx], state = _normalize_channel_like_nnunet(
+            data[channel_idx],
+            pseudo_seg[0],
+            normalizer_class,
+            configuration_manager.use_mask_for_norm[channel_idx],
+            plans_manager.foreground_intensity_properties_per_channel[str(channel_idx)],
+        )
+        normalization_states.append(state)
+
+    target_spacing = list(configuration_manager.spacing)
+    if len(target_spacing) < len(data.shape[1:]):
+        target_spacing = [original_spacing[0], *target_spacing]
+    new_shape = compute_new_shape(data.shape[1:], original_spacing, target_spacing)
+    data = configuration_manager.resampling_fn_data(data, new_shape, original_spacing, target_spacing)
+    if isinstance(data, torch.Tensor):
+        data = data.cpu().numpy()
+
+    reference_image = sitk.ReadImage(str(case_path))
+    return {
+        'data': data.astype(np.float32, copy=False),
+        'properties': properties,
+        'reference_image': reference_image,
+        'normalization_states': normalization_states,
+    }
+
+
+def revert_preprocessing_like_nnunet(
+    array: np.ndarray,
+    properties: dict,
+    plans_manager,
+    configuration_manager,
+    normalization_states: List[NormalizationState],
+    output_kind: str,
+) -> np.ndarray:
+    spacing_transposed = [properties['spacing'][i] for i in plans_manager.transpose_forward]
+    current_spacing = list(configuration_manager.spacing)
+    if len(current_spacing) < len(properties['shape_after_cropping_and_before_resampling']):
+        current_spacing = [spacing_transposed[0], *current_spacing]
+
+    restored = configuration_manager.resampling_fn_data(
+        array,
+        properties['shape_after_cropping_and_before_resampling'],
+        current_spacing,
+        spacing_transposed,
+    )
+    if isinstance(restored, torch.Tensor):
+        restored = restored.cpu().numpy()
+    restored = restored.astype(np.float32, copy=False)
+
+    restored = _invert_normalization(restored, normalization_states, output_kind=output_kind)
+
+    uncropped = np.zeros((restored.shape[0], *properties['shape_before_cropping']), dtype=np.float32)
+    slicer = bounding_box_to_slice(properties['bbox_used_for_cropping'])
+    uncropped[(slice(None), *slicer)] = restored
+
+    transpose_backward = [0, *[i + 1 for i in plans_manager.transpose_backward]]
+    uncropped = uncropped.transpose(transpose_backward)
+    return uncropped
 
 
 def build_enhancer_and_patch_size(
@@ -120,7 +331,7 @@ def build_enhancer_and_patch_size(
     enhancer = network.enhancer
     enhancer.eval()
     patch_size = tuple(int(i) for i in configuration_manager.patch_size)
-    return enhancer, patch_size
+    return enhancer, patch_size, plans_manager, configuration_manager, dataset
 
 
 def collect_input_files(input_path: Path) -> List[Path]:
@@ -237,7 +448,7 @@ def run_inference(args, trainer_cls: Type, model_name: str) -> None:
     ensure_dir(enhanced_dir)
     ensure_dir(residual_dir)
 
-    enhancer, patch_size = build_enhancer_and_patch_size(
+    enhancer, patch_size, plans_manager, configuration_manager, dataset_json = build_enhancer_and_patch_size(
         checkpoint_path=Path(args.checkpoint),
         device=device,
         plans_json=Path(args.plans_json),
@@ -251,17 +462,23 @@ def run_inference(args, trainer_cls: Type, model_name: str) -> None:
     print(f'[INFO] Using device: {device}')
     print(f'[INFO] Patch size: {patch_size}')
     print(f'[INFO] Number of cases: {len(input_files)}')
+    print('[INFO] Preprocessing: nnUNet-consistent transpose -> crop -> normalize -> resample')
 
-    case_progress = tqdm(input_files, desc=f'{model_name} trained enhancement inference', unit='case')
-    for case_path in case_progress:
-        case_progress.set_postfix_str(case_path.name)
-        ref_image, raw = load_nii(case_path)
-        raw_norm, mean, std = normalize_volume(raw)
-        raw_tensor = torch.from_numpy(raw_norm[None])
+    # case_progress = tqdm(input_files, desc=f'{model_name} trained enhancement inference', unit='case')
+    for case_path in input_files:
+        # case_progress.set_postfix_str(case_path.name)
+        print(f'[INFO] Processing case: {case_path.name}')
+        preprocessed = preprocess_case_like_nnunet(
+            case_path=case_path,
+            plans_manager=plans_manager,
+            configuration_manager=configuration_manager,
+            dataset_json=dataset_json,
+        )
+        input_tensor = torch.from_numpy(preprocessed['data'])
 
         prediction = predict_sliding_window(
             enhancer=enhancer,
-            input_tensor=raw_tensor,
+            input_tensor=input_tensor,
             patch_size=patch_size,
             device=device,
             case_name=case_path.name,
@@ -270,15 +487,27 @@ def run_inference(args, trainer_cls: Type, model_name: str) -> None:
             use_amp=not args.disable_amp,
         )
 
-        enhanced_norm = prediction['enhanced'][0].numpy()
-        residual_norm = prediction['residual'][0].numpy()
+        enhanced = revert_preprocessing_like_nnunet(
+            prediction['enhanced'].numpy(),
+            preprocessed['properties'],
+            plans_manager,
+            configuration_manager,
+            preprocessed['normalization_states'],
+            output_kind='enhanced',
+        )[0]
+        residual = revert_preprocessing_like_nnunet(
+            prediction['residual'].numpy(),
+            preprocessed['properties'],
+            plans_manager,
+            configuration_manager,
+            preprocessed['normalization_states'],
+            output_kind='residual',
+        )[0]
 
-        enhanced = denormalize_volume(enhanced_norm, mean, std)
-        residual = denormalize_residual(residual_norm, std)
-
-        save_nii(enhanced, ref_image, enhanced_dir / case_path.name)
-        save_nii(residual, ref_image, residual_dir / case_path.name)
+        save_nii(enhanced, preprocessed['reference_image'], enhanced_dir / case_path.name)
+        save_nii(residual, preprocessed['reference_image'], residual_dir / case_path.name)
         tqdm.write(f'[SAVE] {case_path.name}')
+
 
 
 def build_parser(model_name: str) -> argparse.ArgumentParser:

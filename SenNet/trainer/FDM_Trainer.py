@@ -98,14 +98,23 @@ class FDMTrainer(SenTrainer):
                 weights = weights / weights.sum()
                 deep_supervision_weights = weights.tolist()
 
-        lambda_boundary = 0.2
-        lambda_anatomy = 0.1
+        boundary_mode = os.environ.get("SENNET_FDM_BOUNDARY_MODE", "traditional")
+        lambda_boundary = float(os.environ.get("SENNET_FDM_LAMBDA_BOUNDARY", "0.2"))
+        lambda_anatomy = float(os.environ.get("SENNET_FDM_LAMBDA_ANATOMY", "0.05"))
+
+        boundary_class_weights = None
+        raw_class_weights = os.environ.get("SENNET_FDM_BOUNDARY_CLASS_WEIGHTS", "").strip()
+        if raw_class_weights:
+            boundary_class_weights = [float(item.strip()) for item in raw_class_weights.split(",") if item.strip()]
+
         return FDMHybridLoss(
             deep_supervision=self.enable_deep_supervision,
             deep_supervision_weights=deep_supervision_weights,
             lambda_seg=1.0,
             lambda_boundary=lambda_boundary,
             lambda_anatomy=lambda_anatomy,
+            boundary_mode=boundary_mode,
+            boundary_class_weights=boundary_class_weights,
         )
 
     def initialize(self):
@@ -263,7 +272,7 @@ class FDMTrainer(SenTrainer):
         return result
 class SFFDMTrainer(FDMTrainer):
     """"
-    跳跃连接加入特征选择模块
+    璺宠穬杩炴帴鍔犲叆鐗瑰緛閫夋嫨妯″潡
     """
     def __init__(
             self,
@@ -304,7 +313,7 @@ class SFFDMTrainer(FDMTrainer):
 class FDTMTrainer(FDMTrainer):
 
     """
-        修改mamba模块加入GSC和LayerNorm
+        淇敼mamba妯″潡鍔犲叆GSC鍜孡ayerNorm
     """
     @staticmethod
     def build_network_architecture(
@@ -332,7 +341,7 @@ class FDTMTrainer(FDMTrainer):
 
 class SFFDTMTrainer(FDTMTrainer):
     """
-    FDTM + 特征选择模块
+    FDTM + 鐗瑰緛閫夋嫨妯″潡
     """
 
     def __init__(

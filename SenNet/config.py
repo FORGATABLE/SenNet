@@ -56,7 +56,6 @@ class AblationConfig(BaseConfig):
 ablation_config = AblationConfig()
 main_config: BaseConfig = ablation_config  # 主配置。
 
-patch_size = main_config.patch_size
+patch_size = (128, 128, 128)  # 主配置的 patch size。
 label_map = main_config.label_map
-
 
